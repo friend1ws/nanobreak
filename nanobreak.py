@@ -222,7 +222,7 @@ def add_consensus_seq(input_file, output_file, start_margin = 120, min_inclusion
             
         def __del__(self):
             self.hout.close()
-            shutil.rmtree(self.tmp_dir)
+            # shutil.rmtree(self.tmp_dir)
 
         def initialize(self, cluster_id, cluster_info):
             self.cluster_id = cluster_id
@@ -264,16 +264,19 @@ def add_consensus_seq(input_file, output_file, start_margin = 120, min_inclusion
                 subprocess.check_call(["minimap2", "-x", "map-ont", self.tmp_dir + '/' + self.cluster_id + "_ref.fa",
                                        self.tmp_dir + '/' + self.cluster_id + "_reads.fa"], stderr = subprocess.DEVNULL, stdout = hout_paf2)
 
-            with open(self.tmp_dir + '/' + self.cluster_id + "_ref_polished.fa", 'w') as hout_ref2:
-                subprocess.check_call(["racon", self.tmp_dir + '/' + self.cluster_id + "_reads.fa",
-                                       self.tmp_dir + '/' + self.cluster_id + "_ova_minimap2.paf",
-                                       self.tmp_dir + '/' + self.cluster_id + "_ref.fa"], stderr = subprocess.DEVNULL, stdout = hout_ref2)
-
             consensus = ''
-            with open(self.tmp_dir + '/' + self.cluster_id + "_ref_polished.fa", 'r') as hin_ref2:
-                for line in hin_ref2:
-                    if line.startswith('>'): continue
-                    consensus = consensus + line.rstrip('\n')
+            try:
+                with open(self.tmp_dir + '/' + self.cluster_id + "_ref_polished.fa", 'w') as hout_ref2:
+                    subprocess.check_call(["racon", self.tmp_dir + '/' + self.cluster_id + "_reads.fa",
+                                           self.tmp_dir + '/' + self.cluster_id + "_ova_minimap2.paf",
+                                           self.tmp_dir + '/' + self.cluster_id + "_ref.fa"], stderr = subprocess.DEVNULL, stdout = hout_ref2)
+
+                with open(self.tmp_dir + '/' + self.cluster_id + "_ref_polished.fa", 'r') as hin_ref2:
+                    for line in hin_ref2:
+                        if line.startswith('>'): continue
+                        consensus = consensus + line.rstrip('\n')
+            except:
+                consensus = ''
 
             if len(consensus) < 1000: return
                         
@@ -363,7 +366,7 @@ def locate_breakpoint(input_file, output_file, reference_file, margin = 200):
     bp_loc = Breakpoint_locator()
     fasta_file = pysam.FastaFile(reference_file)
 
-    with open(input_mfile, 'r') as hin, open(output_file, 'w') as hout:
+    with open(input_file, 'r') as hin, open(output_file, 'w') as hout:
         for row in csv.reader(hin,delimiter = '\t'):
             if row[4] == '+':
                 seq_around_bp = fasta_file.fetch(row[1], int(row[2]) - margin, int(row[3]))
@@ -449,7 +452,7 @@ def long_read_validate(input_file, tumor_bam, normal_bam, output_file, reference
         with open(input_file, 'r') as hin:
             for row in csv.reader(hin, delimiter = '\t'):
                 key = '\t'.join(row[:4])
-                for read in bam_hin.fetch(row[1], int(row[2]) - 100, int(row[2]) + 100):
+                for read in bam_hin.fetch(row[1], max(int(row[2]) - 100, 0), int(row[2]) + 100):
                     if read.is_secondary: continue
                     if read.qname not in rname2key: rname2key[read.qname] = []
                     rname2key[read.qname].append(key)
