@@ -2,6 +2,7 @@
 
 import sys, os, gzip, subprocess, csv, shutil, statistics, tempfile
 import pysam
+import nanomonsv
 
 def reverse_complement(seq):
     complement = {'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A',
@@ -83,18 +84,20 @@ def parse_alignment_info(input_bam, output_file, min_clipping_size = 200):
 
 
 
-def cluster_breakpoints(input_file, output_file, min_read_num = 3, min_median_mapq = 40.0, margin = 30):
+def cluster_breakpoints(tumor_bp_file, normal_bp_file, output_file, min_tumor_read_num = 3, max_normal_read_num = 2, min_median_mapq = 40.0, margin = 30):
 
     class Cluster_flusher(object):
 
-        def __init__(self, output_h, min_read_num, min_median_mapq):
+        def __init__(self, output_h, normal_bp_tb, min_tumor_read_num, max_normal_read_num, min_median_mapq):
             self.chr = ''
             self.pos_plus = 0
             self.pos_minus = 0
             self.line_plus = []
             self.line_minus = []
             self.output_h = output_h
-            self.min_read_num = min_read_num
+            self.normal_bp_tb = normal_bp_tb
+            self.min_tumor_read_num = min_tumor_read_num
+            self.min_normal_read_num = max_normal_read_num
             self.min_median_mapq = min_median_mapq
             self.cluster_id = 0
 
@@ -102,12 +105,24 @@ def cluster_breakpoints(input_file, output_file, min_read_num = 3, min_median_ma
 
             tlines = self.line_plus if strand == '+' else self.line_minus
 
-            if len(tlines) < self.min_read_num: return
+            if len(tlines) < self.min_tumor_read_num: return
             if statistics.median([int(x[9]) for x in tlines]) < self.min_median_mapq: return
-    
+
             tstart = min([int(x[2]) for x in tlines]) - 1
             tend = max([int(x[2]) for x in tlines])
-            # print("%s\t%s\t%d\t%d\t%s" % (self.cluster_id, self.chr, tstart, tend, strand), file = self.cluster_info_file_h)
+ 
+            normal_count = 0
+            tabix_error_flag = False
+            try:            
+                records = self.normal_bp_tb.fetch(self.chr, tstart - 5, tend + 5)
+            except:
+                tabix_error_flag = True
+
+            if not tabix_error_flag:
+                for rec in records:
+                    normal_count = normal_count + 1
+        
+            if normal_count >= self.min_normal_read_num: return
 
             for tl in tlines:
                 print("%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % 
@@ -117,9 +132,9 @@ def cluster_breakpoints(input_file, output_file, min_read_num = 3, min_median_ma
             self.cluster_id = self.cluster_id + 1
     
 
-    with gzip.open(input_file, 'rt') as hin, open(output_file, 'w') as hout:
+    with gzip.open(tumor_bp_file, 'rt') as hin, open(output_file, 'w') as hout, pysam.TabixFile(normal_bp_file) as normal_bp_tb:
 
-        cluster_flusher = Cluster_flusher(hout, min_read_num, min_median_mapq)
+        cluster_flusher = Cluster_flusher(hout, normal_bp_tb, min_tumor_read_num, max_normal_read_num, min_median_mapq)
         for row in csv.reader(hin, delimiter = '\t'):
 
             # skip secondary alignment
@@ -259,6 +274,8 @@ def add_consensus_seq(input_file, output_file, start_margin = 120, min_inclusion
                 for line in hin_ref2:
                     if line.startswith('>'): continue
                     consensus = consensus + line.rstrip('\n')
+
+            if len(consensus) < 1000: return
                         
             print("%s\t%s\t%s" % (self.cluster_id, self.cluster_info, consensus), file = self.hout)
               
@@ -279,36 +296,150 @@ def add_consensus_seq(input_file, output_file, start_margin = 120, min_inclusion
 
  
 
+def locate_breakpoint(input_file, output_file, reference_file, margin = 200):
+
+    class Breakpoint_locator(object):
+
+        def __init__(self):
+
+            self.consensus = None
+            self.seq_around_bp = None
+            self.seq_start = None
+            self.seq_end = None
+            self.seq_dir = None
+            self.bp_pos_consensus = None
+            self.bp_pos_reference = None
+            self.tmp_dir = tempfile.mkdtemp()
+
+
+        def __del__(self):
+            shutil.rmtree(self.tmp_dir)            
+
+        def initialize(self, cluster_id, consensus, seq_around_bp, seq_start, seq_end, seq_dir):
+
+            self.cluster_id = cluster_id
+            self.consensus = consensus
+            self.seq_around_bp = seq_around_bp
+            self.seq_start = seq_start
+            self.seq_end = seq_end
+            self.seq_dir = seq_dir
+            self.bp_pos_consensus = None
+            self.bp_pos_reference = None
+            if len(self.consensus) >= 1000: self.consensus = self.consensus[:1000]
+
+        def locate_by_alignment(self):
+    
+            with open(self.tmp_dir + '/' + self.cluster_id + ".query.fa", 'w') as hout:
+                print(">query_%s\n%s" % (self.cluster_id, self.seq_around_bp), file = hout)
+
+            with open(self.tmp_dir + '/' + self.cluster_id + ".target.fa", 'w') as hout:
+                print(">target_%s\n%s" % (self.cluster_id, self.consensus), file = hout)
+
+            alignment_info = nanomonsv.long_read_validate.ssw_check(
+                self.tmp_dir + '/' + self.cluster_id + ".target.fa", 
+                self.tmp_dir + '/' + self.cluster_id + ".query.fa")
+
+            print(self.seq_start, self.seq_end, self.seq_dir)
+            print(alignment_info["query_" + self.cluster_id])
+
+            if "query_" + self.cluster_id not in alignment_info: return
+            _, tstart_a, tend_a, qstart_a, qend_a, strand_a = alignment_info["query_" + self.cluster_id]
+            if strand_a != '+': return
+
+            self.bp_pos_consensus = tend_a
+            if self.seq_dir == '+':
+                self.bp_pos_reference = self.seq_end - (len(self.seq_around_bp) - qend_a) 
+            else:
+                self.bp_pos_reference = self.seq_start + (len(self.seq_around_bp) - qend_a)
+
+            print(self.bp_pos_reference, self.bp_pos_consensus)
+            """
+            60001 60203 -
+            {'query_0': [374, 67, 265, 1, 203, '+']}
+            
+            """
+
+
+    bp_loc = Breakpoint_locator()
+    fasta_file = pysam.FastaFile(reference_file)
+
+    with open(input_file, 'r') as hin, open(output_file, 'w') as hout:
+        for row in csv.reader(hin,delimiter = '\t'):
+            if row[4] == '+':
+                seq_around_bp = fasta_file.fetch(row[1], int(row[2]) - margin, int(row[3]))
+                bp_loc.initialize(row[0], row[5], seq_around_bp, int(row[2]) - margin + 1, int(row[3]), '+')
+            else:
+                seq_around_bp = fasta_file.fetch(row[1], int(row[2]), int(row[3]) + margin)
+                seq_around_bp = reverse_complement(seq_around_bp)
+                bp_loc.initialize(row[0], row[5], seq_around_bp, int(row[2]) + 1, int(row[3]) + margin, '-')
+
+            bp_loc.locate_by_alignment()
+    
+            if bp_loc.bp_pos_reference is not None:
+                print("%s\t%s\t%d\t%s\t%s" % (row[0], row[1], bp_loc.bp_pos_reference, row[4], row[5][bp_loc.bp_pos_consensus:]), file = hout)
+  
+    del bp_loc
+    fasta_file.close()
 
 
 if __name__ == "__main__":
 
     import sys
 
-    input_bam = sys.argv[1]
-    output_prefix = sys.argv[2]
+    tumor_bam = sys.argv[1]
+    normal_bam = sys.argv[2]
+    output_prefix = sys.argv[3]
+    reference_file = sys.argv[4]
 
     """
-    parse_alignment_info(input_bam, output_prefix + ".tmp.nbp_parse.bed")
+    ##########
+    # tumor parse
+    parse_alignment_info(tumor_bam, output_prefix + ".tmp.tumor.bp_parse.bed")
 
-    hout = open(output_prefix + ".tmp.nbp_parse.sorted.bed", 'w')
-    subprocess.check_call(["sort", "-k1,1", "-k2,2n", output_prefix + ".tmp.nbp_parse.bed"], stdout = hout)
+    hout = open(output_prefix + ".tmp.tumor.bp_parse.sorted.bed", 'w')
+    subprocess.check_call(["sort", "-k1,1", "-k2,2n", output_prefix + ".tmp.tumor.bp_parse.bed"], stdout = hout)
     hout.close()
 
-    hout = open(output_prefix + ".tmp.nbp_parse.sorted.bed.gz", 'w')
-    subprocess.check_call(["bgzip", "-f", "-c", output_prefix + ".tmp.nbp_parse.sorted.bed"], stdout = hout)
+    hout = open(output_prefix + ".tmp.tumor.bp_parse.sorted.bed.gz", 'w')
+    subprocess.check_call(["bgzip", "-f", "-c", output_prefix + ".tmp.tumor.bp_parse.sorted.bed"], stdout = hout)
     hout.close()
-
-    subprocess.check_call(["tabix", "-p", "bed", output_prefix + ".tmp.nbp_parse.sorted.bed.gz"])
-
-    os.remove(output_prefix + ".tmp.nbp_parse.bed")
-    os.remove(output_prefix + ".tmp.nbp_parse.sorted.bed")
-
-    cluster_breakpoints(output_prefix + ".tmp.nbp_parse.sorted.bed.gz", 
-                        output_prefix + ".tmp.nbp_parse.cluster_info.txt")
     
-    add_sequence(output_prefix + ".tmp.nbp_parse.cluster_info.txt", input_bam, output_prefix + ".tmp.nbp_parse.cluster_info_seq.txt")
+    subprocess.check_call(["tabix", "-p", "bed", output_prefix + ".tmp.tumor.bp_parse.sorted.bed.gz"])
+    
+    os.remove(output_prefix + ".tmp.tumor.bp_parse.bed")
+    os.remove(output_prefix + ".tmp.tumor.bp_parse.sorted.bed")
+    ##########
+
+    ##########
+    # normal parse
+    parse_alignment_info(normal_bam, output_prefix + ".tmp.normal.bp_parse.bed")
+
+    hout = open(output_prefix + ".tmp.normal.bp_parse.sorted.bed", 'w')
+    subprocess.check_call(["sort", "-k1,1", "-k2,2n", output_prefix + ".tmp.normal.bp_parse.bed"], stdout = hout)
+    hout.close()
+    
+    hout = open(output_prefix + ".tmp.normal.bp_parse.sorted.bed.gz", 'w')
+    subprocess.check_call(["bgzip", "-f", "-c", output_prefix + ".tmp.normal.bp_parse.sorted.bed"], stdout = hout)
+    hout.close()
+    
+    subprocess.check_call(["tabix", "-p", "bed", output_prefix + ".tmp.normal.bp_parse.sorted.bed.gz"])
+        
+    os.remove(output_prefix + ".tmp.normal.bp_parse.bed")
+    os.remove(output_prefix + ".tmp.normal.bp_parse.sorted.bed")
+    ##########
     """
+
+    cluster_breakpoints(output_prefix + ".tmp.tumor.bp_parse.sorted.bed.gz", 
+                        output_prefix + ".tmp.normal.bp_parse.sorted.bed.gz",
+                        output_prefix + ".tmp.nbp_parse.cluster_info.txt")
+  
+    add_sequence(output_prefix + ".tmp.nbp_parse.cluster_info.txt", tumor_bam, output_prefix + ".tmp.nbp_parse.cluster_info_seq.txt")
 
     add_consensus_seq(output_prefix + ".tmp.nbp_parse.cluster_info_seq.txt", output_prefix + ".tmp.nbp_parse.cluster_info_consensus.txt")
+
+
+    locate_breakpoint(output_prefix + ".tmp.nbp_parse.cluster_info_consensus.txt", 
+        output_prefix + ".tmp.nbp_parse.bp_info_consensus.txt",
+        reference_file)
+
 
