@@ -1,0 +1,84 @@
+configfile: "config.yaml"
+
+rule all:
+    input:
+        expand("{output_dir}/{sample_name}.nanobreak.result.txt", output_dir=config["output_dir"], sample_name=config["samples"])
+
+rule parse_bp:
+    input:
+        lambda wildcards: config["samples"][wildcards.sample_name][wildcards.tn_type + "_bam"]
+    output:
+        temp("{output_dir}/{sample_name}.tmp.{tn_type}.bp_parse.bed")
+    script:
+        "scripts/parse_bp.py"
+
+rule sort_parsed_bed:
+    input:
+        "{output_dir}/{sample_name}.tmp.{tn_type}.bp_parse.bed"
+    output:
+        bed_gz=temp("{output_dir}/{sample_name}.tmp.{tn_type}.bp_parse.sorted.bed.gz"),
+        bed_gz_tbi=temp("{output_dir}/{sample_name}.tmp.{tn_type}.bp_parse.sorted.bed.gz.tbi")
+    shell:
+        "sort -k1,1 -k2,2n {input} > {input}.sorted && "
+        "bgzip -f -c {input}.sorted > {output.bed_gz} && "
+        "tabix -p bed {output.bed_gz} && "
+        "rm {input}.sorted"
+
+rule cluster_bp:
+    input:
+        "{output_dir}/{sample_name}.tmp.tumor.bp_parse.sorted.bed.gz",
+        "{output_dir}/{sample_name}.tmp.normal.bp_parse.sorted.bed.gz",
+        "{output_dir}/{sample_name}.tmp.tumor.bp_parse.sorted.bed.gz.tbi",
+        "{output_dir}/{sample_name}.tmp.normal.bp_parse.sorted.bed.gz.tbi"
+    output:
+        temp("{output_dir}/{sample_name}.tmp.nbp_parse.cluster_info.txt")
+    script:
+        "scripts/cluster_bp.py"
+
+rule add_sequence:
+    input:
+        "{output_dir}/{sample_name}.tmp.nbp_parse.cluster_info.txt",
+        lambda wildcards: config["samples"][wildcards.sample_name]["tumor_bam"]
+    output:
+        temp("{output_dir}/{sample_name}.tmp.nbp_parse.cluster_info_seq.txt")
+    script:
+        "scripts/add_sequence.py"
+
+rule add_consensus_seq:
+    input:
+        "{output_dir}/{sample_name}.tmp.nbp_parse.cluster_info_seq.txt"
+    output:
+        temp("{output_dir}/{sample_name}.tmp.nbp_parse.cluster_info_consensus.txt")
+    script:
+        "scripts/add_consensus_seq.py"
+
+rule locate_bp:
+    input:
+        "{output_dir}/{sample_name}.tmp.nbp_parse.cluster_info_consensus.txt",
+        config["reference_genome"]
+    output:
+        "{output_dir}/{sample_name}.tmp.nbp_parse.bp_info_consensus.txt"
+    script:
+        "scripts/locate_bp.py"
+
+rule count_read_by_alignment:
+    input:
+        "{output_dir}/{sample_name}.tmp.nbp_parse.bp_info_consensus.txt",
+        lambda wildcards: config["samples"][wildcards.sample_name]["tumor_bam"],
+        config["reference_genome"]
+    output:
+        "{output_dir}/{sample_name}.tmp.{tn_type}.bp_cluster.alignment_count.txt"
+    script:    
+        "scripts/count_read_by_alignment.py"
+
+rule join:
+    input:
+        "{output_dir}/{sample_name}.tmp.nbp_parse.bp_info_consensus.txt",
+        "{output_dir}/{sample_name}.tmp.tumor.bp_cluster.alignment_count.txt",
+        "{output_dir}/{sample_name}.tmp.normal.bp_cluster.alignment_count.txt"
+    output:
+        "{output_dir}/{sample_name}.nanobreak.result.txt"
+    script:
+        "scripts/join_result.py"
+
+
